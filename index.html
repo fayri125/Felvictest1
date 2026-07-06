@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Felvic Medialliance</title>
+<link rel="manifest" href="manifest.json" />
+<meta name="theme-color" content="#233026" />
+<link rel="apple-touch-icon" href="icons/icon-192.png" />
+<link rel="icon" href="icons/icon-192.png" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  body { margin:0; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+// ---- Storage shim, backed by Firebase Firestore ----
+// This gives real cross-device sharing: a client's request made on one
+// phone is visible to nurses on any other phone, and vice versa.
+const firebaseConfig = {
+  apiKey: "AIzaSyC6L01-Oy8YaPerRztqGHMXzY7u3DzCKm8",
+  authDomain: "felvic-medalliance.firebaseapp.com",
+  projectId: "felvic-medalliance",
+  storageBucket: "felvic-medalliance.firebasestorage.app",
+  messagingSenderId: "517237843456",
+  appId: "1:517237843456:web:f88f2793d1bb3c98ee5ae5",
+  measurementId: "G-NTELQPL2HN",
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+const KV = db.collection("kv_store");
+
+window.storage = {
+  async get(key, shared) {
+    const doc = await KV.doc(key).get();
+    if (!doc.exists) throw new Error("not found");
+    return { key, value: doc.data().value, shared };
+  },
+  async set(key, value, shared) {
+    await KV.doc(key).set({ value, updatedAt: Date.now() });
+    return { key, value, shared };
+  },
+  async delete(key, shared) {
+    await KV.doc(key).delete();
+    return { key, deleted: true, shared };
+  },
+  async list(prefix, shared) {
+    let query = KV;
+    if (prefix) {
+      query = query
+        .orderBy(firebase.firestore.FieldPath.documentId())
+        .startAt(prefix)
+        .endAt(prefix + "\uf8ff");
+    }
+    const snap = await query.get();
+    return { keys: snap.docs.map((d) => d.id), prefix, shared };
+  },
+};
+</script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const SERVICES = [
+  "Wound Care",
+  "Medication Support",
+  "Physiotherapy",
+  "Post-Surgery Care",
+  "Elderly Companionship",
+  "Vital Monitoring",
+];
+
+const SLOTS = ["07:00", "09:00", "11:00", "14:00", "16:00", "19:00"];
+
+// Change this to whatever passcode your admin team should use.
+const ADMIN_PASSCODE = "felvic2024";
+
+const STATUS_LABEL = {
+  pending: "Waiting for a nurse",
+  accepted: "Nurse assigned",
+  on_the_way: "Nurse on the way",
+  arrived: "Nurse arrived",
+  completed: "Completed",
+  cancelled: "Cancelled",
+};
+const STATUS_STYLE = {
+  pending: { background: "#F4E9C9", color: "#8A6D2A" },
+  accepted: { background: "#DCE8D9", color: "#1E8E3E" },
+  on_the_way: { background: "#DCE3EF", color: "#3E5A8A" },
+  arrived: { background: "#DCE3EF", color: "#3E5A8A" },
+  completed: { background: "#E4E1D6", color: "#5C5645" },
+  cancelled: { background: "#F6DCDC", color: "#C21F27" },
+};
+
+function next7Days() {
+  const out = [];
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() + i);
+    out.push(d);
+  }
+  return out;
+}
+function fmtKey(d) { return d.toISOString().slice(0, 10); }
+function fmtLabel(d) { return d.toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" }); }
+function initials(name) {
+  return (name || "?").trim().split(/\s+/).slice(0, 2).map(w => w[0]?.toUpperCase()).join("");
+}
+function nurseStats(requests, phone) {
+  const rated = requests.filter(r => r.nurse?.phone === phone && typeof r.rating === "number");
+  if (rated.length === 0) return null;
+  const avg = rated.reduce((s, r) => s + r.rating, 0) / rated.length;
+  return { avg, count: rated.length };
+}
+async function loadMap(key) {
+  try {
+    const res = await window.storage.get(key, true);
+    return res ? JSON.parse(res.value) : {};
+  } catch {
+    return {};
+  }
+}
+async function saveMap(key, map) {
+  await window.storage.set(key, JSON.stringify(map), true);
+}
+
+const COLORS = {
+  bg: "#F3F1E9", ink: "#233026", card: "#FFFFFF", chip: "#EFEAD9",
+  green: "#1E8E3E", red: "#C21F27", muted: "#8A8272", gold: "#8A6D4B", line: "#EDE7D6", err: "#C21F27",
+};
+const fontDisplay = "'Fraunces', serif";
+const fontMono = "'IBM Plex Mono', monospace";
+
+// ---- Simple flame mark, inspired by the Felvic Medialliance logo ----
+function FlameMark({ size = 36 }) {
+  return (
+    <svg width={size} height={size * 1.3} viewBox="0 0 100 130" fill="none">
+      <path
+        d="M62 4C40 16 24 34 24 56C24 66 28 74 34 79C30 62 40 46 58 36C70 29 76 18 72 4C69 12 66 8 62 4Z"
+        fill="#1E8E3E"
+      />
+      <path
+        d="M56 40C40 50 30 64 32 80C34 96 44 104 50 126C50 108 62 96 66 82C70 68 64 54 52 50C58 46 60 42 56 40Z"
+        fill="#C21F27"
+      />
+    </svg>
+  );
+}
+
+function useRequests() {
+  const [requests, setRequests] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await window.storage.get("service_requests", true);
+      const list = res ? JSON.parse(res.value) : [];
+      setRequests(list);
+      return list;
+    } catch {
+      setRequests([]);
+      return [];
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 4000);
+    return () => clearInterval(id);
+  }, [load]);
+
+  const save = useCallback(async (list) => {
+    setRequests(list);
+    try {
+      await window.storage.set("service_requests", JSON.stringify(list), true);
+    } catch {}
+  }, []);
+
+  const updateRequest = useCallback(async (id, updater) => {
+    setRequests((current) => {
+      const updated = current.map((r) => (r.id === id ? updater(r) : r));
+      window.storage.set("service_requests", JSON.stringify(updated), true).catch(() => {});
+      return updated;
+    });
+  }, []);
+
+  return { requests, loading, save, updateRequest };
+}
+
+function Segmented({ value, onChange }) {
+  return (
+    <div className="flex rounded-full p-1" style={{ background: "#16211A" }}>
+      {["client", "nurse"].map((v) => (
+        <button
+          key={v}
+          onClick={() => onChange(v)}
+          className="flex-1 py-2 rounded-full text-sm font-medium capitalize"
+          style={value === v ? { background: COLORS.green, color: "#fff" } : { color: "#9FB39C" }}
+        >
+          {v === "client" ? "I need care" : "I'm a nurse"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function StatusPill({ status }) {
+  const style = STATUS_STYLE[status] || STATUS_STYLE.pending;
+  return (
+    <span className="text-[11px] px-2 py-1 rounded-full uppercase tracking-wide" style={{ ...style, fontFamily: fontMono }}>
+      {STATUS_LABEL[status] || status}
+    </span>
+  );
+}
+
+function Stars({ value, onRate, readOnly }) {
+  const stars = [1, 2, 3, 4, 5];
+  return (
+    <div className="flex gap-1">
+      {stars.map((n) => (
+        <button
+          key={n}
+          disabled={readOnly}
+          onClick={() => onRate && onRate(n)}
+          className="text-lg leading-none"
+          style={{ color: n <= (value || 0) ? "#C9A227" : "#D9D2BE", cursor: readOnly ? "default" : "pointer" }}
+        >
+          ★
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Field({ label, ...props }) {
+  return (
+    <div className="mb-2.5">
+      {label && <label className="text-[11px] uppercase tracking-wide block mb-1" style={{ color: COLORS.muted }}>{label}</label>}
+      <input {...props} className="w-full px-3 py-2.5 rounded-lg text-sm outline-none" style={{ background: "#F6F4EA", color: COLORS.ink }} />
+    </div>
+  );
+}
+
+// ---- Client login / signup ----
+function ClientAuth({ onVerified }) {
+  const [stage, setStage] = useState("phone");
+  const [phone, setPhone] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [address, setAddress] = useState("");
+  const [area, setArea] = useState("");
+  const [emergencyContact, setEmergencyContact] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function handlePhoneContinue() {
+    setError("");
+    if (!phone.trim()) return setError("Enter your phone number.");
+    setBusy(true);
+    const profiles = await loadMap("client_profiles");
+    setBusy(false);
+    const existing = profiles[phone.trim()];
+    if (existing) {
+      onVerified(phone.trim(), existing);
+    } else {
+      setStage("signup");
+    }
+  }
+
+  async function handleSignup() {
+    setError("");
+    if (!fullName.trim()) return setError("Enter your full name.");
+    if (!address.trim()) return setError("Enter your address.");
+    const profile = { fullName: fullName.trim(), phone: phone.trim(), email: email.trim(), address: address.trim(), area: area.trim(), emergencyContact: emergencyContact.trim() };
+    setBusy(true);
+    const profiles = await loadMap("client_profiles");
+    profiles[phone.trim()] = profile;
+    await saveMap("client_profiles", profiles);
+    setBusy(false);
+    onVerified(phone.trim(), profile);
+  }
+
+  if (stage === "phone") {
+    return (
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Log in</h2>
+        <Field placeholder="Phone number" value={phone} onChange={(e) => setPhone(e.target.value)} />
+        {error && <p className="text-xs mb-2" style={{ color: COLORS.err }}>{error}</p>}
+        <button onClick={handlePhoneContinue} disabled={busy} className="w-full py-3 rounded-xl font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>Continue</button>
+        <p className="text-xs mt-2" style={{ color: COLORS.muted }}>New here? Just enter your number — we'll take you to sign up.</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+      <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Create your account</h2>
+      <Field label="Phone" value={phone} disabled />
+      <Field label="Full name" placeholder="Full name" value={fullName} onChange={(e) => setFullName(e.target.value)} />
+      <Field label="Email (optional)" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+      <Field label="Home address" placeholder="House / street / city" value={address} onChange={(e) => setAddress(e.target.value)} />
+      <Field label="Area / locality" placeholder="e.g. Jayanagar, Bengaluru" value={area} onChange={(e) => setArea(e.target.value)} />
+      <Field label="Emergency contact (optional)" placeholder="Name & phone" value={emergencyContact} onChange={(e) => setEmergencyContact(e.target.value)} />
+      {error && <p className="text-xs mb-2" style={{ color: COLORS.err }}>{error}</p>}
+      <button onClick={handleSignup} disabled={busy} className="w-full py-3 rounded-xl font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>Sign up & continue</button>
+      <button onClick={() => setStage("phone")} className="w-full text-xs mt-2" style={{ color: COLORS.muted }}>← Back</button>
+    </section>
+  );
+}
+
+// ---- Nurse login / signup ----
+function NurseAuth({ onVerified }) {
+  const [stage, setStage] = useState("phone");
+  const [phone, setPhone] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [email, setEmail] = useState("");
+  const [experience, setExperience] = useState("");
+  const [qualification, setQualification] = useState("");
+  const [license, setLicense] = useState("");
+  const [area, setArea] = useState("");
+  const [services, setServices] = useState([]);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function handlePhoneContinue() {
+    setError("");
+    if (!phone.trim()) return setError("Enter your phone number.");
+    setBusy(true);
+    const profiles = await loadMap("nurse_profiles");
+    setBusy(false);
+    const existing = profiles[phone.trim()];
+    if (existing) {
+      onVerified(phone.trim(), existing);
+    } else {
+      setStage("signup");
+    }
+  }
+
+  function toggleService(s) {
+    setServices((cur) => (cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s]));
+  }
+
+  async function handleSignup() {
+    setError("");
+    if (!fullName.trim()) return setError("Enter your full name.");
+    if (!license.trim()) return setError("Enter your nursing license / registration number.");
+    if (services.length === 0) return setError("Select at least one service you offer.");
+    const profile = {
+      fullName: fullName.trim(), phone: phone.trim(), email: email.trim(),
+      experience: experience.trim() || "0", qualification: qualification.trim(),
+      license: license.trim(), area: area.trim(), services,
+    };
+    setBusy(true);
+    const profiles = await loadMap("nurse_profiles");
+    profiles[phone.trim()] = profile;
+    await saveMap("nurse_profiles", profiles);
+    setBusy(false);
+    onVerified(phone.trim(), profile);
+  }
+
+  if (stage === "phone") {
+    return (
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Log in</h2>
+        <Field placeholder="Phone number" value={phone} onChange={(e) => setPhone(e.target.value)} />
+        {error && <p className="text-xs mb-2" style={{ color: COLORS.err }}>{error}</p>}
+        <button onClick={handlePhoneContinue} disabled={busy} className="w-full py-3 rounded-xl font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>Continue</button>
+        <p className="text-xs mt-2" style={{ color: COLORS.muted }}>New here? Just enter your number — we'll take you to sign up.</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+      <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Register as a nurse</h2>
+      <Field label="Phone" value={phone} disabled />
+      <Field label="Full name" placeholder="Full name" value={fullName} onChange={(e) => setFullName(e.target.value)} />
+      <Field label="Email (optional)" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} />
+      <Field label="Years of experience" placeholder="e.g. 3" value={experience} onChange={(e) => setExperience(e.target.value)} />
+      <Field label="Qualification" placeholder="e.g. GNM, B.Sc Nursing" value={qualification} onChange={(e) => setQualification(e.target.value)} />
+      <Field label="License / registration number" placeholder="Nursing council registration no." value={license} onChange={(e) => setLicense(e.target.value)} />
+      <Field label="Service area" placeholder="e.g. Jayanagar, Bengaluru" value={area} onChange={(e) => setArea(e.target.value)} />
+      <label className="text-[11px] uppercase tracking-wide block mb-1.5" style={{ color: COLORS.muted }}>Services you offer</label>
+      <div className="flex flex-wrap gap-2 mb-3">
+        {SERVICES.map((s) => (
+          <button key={s} onClick={() => toggleService(s)} className="px-3 py-1.5 rounded-full text-xs"
+            style={services.includes(s) ? { background: COLORS.green, color: "#fff" } : { background: COLORS.chip, color: COLORS.ink }}>
+            {s}
+          </button>
+        ))}
+      </div>
+      {error && <p className="text-xs mb-2" style={{ color: COLORS.err }}>{error}</p>}
+      <button onClick={handleSignup} disabled={busy} className="w-full py-3 rounded-xl font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>Sign up & continue</button>
+      <button onClick={() => setStage("phone")} className="w-full text-xs mt-2" style={{ color: COLORS.muted }}>← Back</button>
+    </section>
+  );
+}
+
+function LoggedInBar({ name, phone, onLogout }) {
+  return (
+    <div className="flex items-center justify-between rounded-xl px-4 py-2.5 mb-4" style={{ background: "#DCE8D9" }}>
+      <span className="text-xs" style={{ color: COLORS.green, fontFamily: fontMono }}>{name} · {phone}</span>
+      <button onClick={onLogout} className="text-xs underline" style={{ color: COLORS.green }}>Log out</button>
+    </div>
+  );
+}
+
+function ChatThread({ request, role, onSend }) {
+  const [text, setText] = useState("");
+  const msgs = request.messages || [];
+  return (
+    <div className="mt-3 rounded-xl p-3" style={{ background: "#F6F4EA" }}>
+      <p className="text-[11px] uppercase tracking-wide mb-2" style={{ color: COLORS.gold, fontFamily: fontMono }}>Messages</p>
+      <div className="space-y-1.5 max-h-40 overflow-y-auto mb-2">
+        {msgs.length === 0 && <p className="text-xs" style={{ color: COLORS.muted }}>No messages yet.</p>}
+        {msgs.map((m, i) => (
+          <div key={i} className="text-xs" style={{ textAlign: m.from === role ? "right" : "left" }}>
+            <span className="inline-block px-2.5 py-1.5 rounded-lg" style={m.from === role ? { background: COLORS.green, color: "#fff" } : { background: "#E4E1D6", color: COLORS.ink }}>
+              {m.text}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="flex gap-2">
+        <input value={text} onChange={(e) => setText(e.target.value)} placeholder="Type a message" className="flex-1 px-3 py-2 rounded-lg text-xs outline-none" style={{ background: "#FFFFFF", color: COLORS.ink }} />
+        <button onClick={() => { if (text.trim()) { onSend(text.trim()); setText(""); } }} className="px-3 py-2 rounded-lg text-xs font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>Send</button>
+      </div>
+    </div>
+  );
+}
+
+function RescheduleBox({ onSave, onCancel }) {
+  const days = useRef(next7Days()).current;
+  const [dateKey, setDateKey] = useState(fmtKey(days[0]));
+  const [time, setTime] = useState(SLOTS[0]);
+  return (
+    <div className="mt-3 rounded-xl p-3" style={{ background: "#F6F4EA" }}>
+      <p className="text-[11px] uppercase tracking-wide mb-2" style={{ color: COLORS.gold, fontFamily: fontMono }}>New date & time</p>
+      <div className="flex gap-2 overflow-x-auto pb-2">
+        {days.map((d) => {
+          const key = fmtKey(d);
+          const activeDay = key === dateKey;
+          return (
+            <button key={key} onClick={() => setDateKey(key)} className="shrink-0 rounded-lg px-2.5 py-1.5 text-center" style={activeDay ? { background: COLORS.green, color: "#fff" } : { background: COLORS.chip, color: COLORS.ink }}>
+              <div className="text-[9px] uppercase" style={{ opacity: .8 }}>{d.toLocaleDateString("en-IN", { weekday: "short" })}</div>
+              <div className="text-xs" style={{ fontFamily: fontMono }}>{d.getDate()}</div>
+            </button>
+          );
+        })}
+      </div>
+      <div className="grid grid-cols-3 gap-2 mt-2">
+        {SLOTS.map((s) => (
+          <button key={s} onClick={() => setTime(s)} className="py-1.5 rounded-lg text-xs" style={time === s ? { background: COLORS.green, color: "#fff", fontFamily: fontMono } : { background: COLORS.chip, color: COLORS.ink, fontFamily: fontMono }}>{s}</button>
+        ))}
+      </div>
+      <div className="flex gap-2 mt-3">
+        <button onClick={() => onSave(dateKey, time)} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>Save new time</button>
+        <button onClick={onCancel} className="flex-1 py-2 rounded-lg text-xs" style={{ background: COLORS.chip, color: COLORS.ink }}>Back</button>
+      </div>
+    </div>
+  );
+}
+
+function ClientView({ requests, updateRequest, save }) {
+  const days = useRef(next7Days()).current;
+  const [session, setSession] = useState(null); // { phone, profile }
+  const [service, setService] = useState(null);
+  const [dateKey, setDateKey] = useState(fmtKey(days[0]));
+  const [time, setTime] = useState(null);
+  const [address, setAddress] = useState("");
+  const [error, setError] = useState("");
+  const [banner, setBanner] = useState(null);
+  const [reschedulingId, setReschedulingId] = useState(null);
+  const seenAccepted = useRef(new Set());
+
+  useEffect(() => {
+    if (session && !address) setAddress(session.profile.address || "");
+    // eslint-disable-next-line
+  }, [session]);
+
+  const myRequests = requests
+    .filter((r) => session && r.phone === session.phone)
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const active = myRequests.filter((r) => !["completed", "cancelled"].includes(r.status));
+  const history = myRequests.filter((r) => ["completed", "cancelled"].includes(r.status));
+
+  useEffect(() => {
+    myRequests.forEach((r) => {
+      if (r.status === "accepted" && !seenAccepted.current.has(r.id)) {
+        seenAccepted.current.add(r.id);
+        setBanner(r);
+      }
+    });
+    // eslint-disable-next-line
+  }, [requests]);
+
+  if (!session) {
+    return <ClientAuth onVerified={(phone, profile) => setSession({ phone, profile })} />;
+  }
+
+  async function submit() {
+    setError("");
+    if (!service) return setError("Select a service.");
+    if (!time) return setError("Select a time.");
+
+    const req = {
+      id: "REQ-" + Math.random().toString(36).slice(2, 8).toUpperCase(),
+      service, date: dateKey, time,
+      clientName: session.profile.fullName, phone: session.phone, address: address.trim(),
+      status: "pending", nurse: null, messages: [], rating: null,
+      createdAt: Date.now(),
+    };
+    const updated = [...requests, req];
+    await save(updated);
+    setService(null); setTime(null);
+  }
+
+  function cancel(id) { updateRequest(id, (r) => ({ ...r, status: "cancelled" })); }
+  function saveReschedule(id, newDate, newTime) {
+    updateRequest(id, (r) => ({
+      ...r, date: newDate, time: newTime, status: "pending", nurse: null,
+      messages: [...(r.messages || []), { from: "client", text: "Visit rescheduled — needs a nurse again.", ts: Date.now() }],
+    }));
+    setReschedulingId(null);
+  }
+  function rate(id, stars) { updateRequest(id, (r) => ({ ...r, rating: stars })); }
+  function sendMsg(id, text) { updateRequest(id, (r) => ({ ...r, messages: [...(r.messages || []), { from: "client", text, ts: Date.now() }] })); }
+
+  return (
+    <div>
+      <LoggedInBar name={session.profile.fullName} phone={session.phone} onLogout={() => setSession(null)} />
+
+      {banner && (
+        <div className="rounded-2xl p-4 mb-4 flex items-start gap-3" style={{ background: "#DCE8D9", border: "1px solid #B9D2B4" }}>
+          <div className="w-10 h-10 rounded-full flex items-center justify-center shrink-0 text-sm font-semibold" style={{ background: COLORS.green, color: "#fff" }}>{initials(banner.nurse?.name)}</div>
+          <div className="flex-1">
+            <p className="text-sm font-medium" style={{ color: COLORS.ink }}>{banner.nurse?.name} accepted your request</p>
+            <p className="text-xs mt-0.5" style={{ color: COLORS.muted }}>{banner.service} · {fmtLabel(new Date(banner.date))} · {banner.time}</p>
+            <p className="text-xs mt-1" style={{ color: COLORS.green, fontFamily: fontMono }}>{banner.nurse?.phone} · {banner.nurse?.experience} yrs experience</p>
+          </div>
+          <button onClick={() => setBanner(null)} className="text-xs" style={{ color: COLORS.muted }}>✕</button>
+        </div>
+      )}
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>1 · Service needed</h2>
+        <div className="flex flex-wrap gap-2">
+          {SERVICES.map((s) => (
+            <button key={s} onClick={() => setService(s)} className="px-3 py-2 rounded-full text-sm" style={service === s ? { background: COLORS.green, color: "#fff" } : { background: COLORS.chip, color: COLORS.ink }}>{s}</button>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>2 · Date & time</h2>
+        <div className="flex gap-2 overflow-x-auto pb-2">
+          {days.map((d) => {
+            const key = fmtKey(d);
+            const activeDay = key === dateKey;
+            return (
+              <button key={key} onClick={() => setDateKey(key)} className="shrink-0 rounded-xl px-3 py-2 text-center" style={activeDay ? { background: COLORS.green, color: "#fff" } : { background: COLORS.chip, color: COLORS.ink }}>
+                <div className="text-[10px] uppercase" style={{ opacity: .8 }}>{d.toLocaleDateString("en-IN", { weekday: "short" })}</div>
+                <div className="text-sm" style={{ fontFamily: fontMono }}>{d.getDate()}</div>
+              </button>
+            );
+          })}
+        </div>
+        <div className="grid grid-cols-3 gap-2 mt-3">
+          {SLOTS.map((s) => (
+            <button key={s} onClick={() => setTime(s)} className="py-2 rounded-lg text-sm" style={time === s ? { background: COLORS.green, color: "#fff", fontFamily: fontMono } : { background: COLORS.chip, color: COLORS.ink, fontFamily: fontMono }}>{s}</button>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>3 · Visit address</h2>
+        <Field placeholder="Address / notes for the nurse" value={address} onChange={(e) => setAddress(e.target.value)} />
+        {error && <p className="text-xs mt-1" style={{ color: COLORS.err }}>{error}</p>}
+        <button onClick={submit} className="w-full mt-2 py-3 rounded-xl font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>Send request</button>
+      </section>
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>My requests</h2>
+        {active.length === 0 ? (
+          <p className="text-sm" style={{ color: COLORS.muted }}>No active requests.</p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: COLORS.line }}>
+            {active.map((r) => {
+              const stats = r.nurse ? nurseStats(requests, r.nurse.phone) : null;
+              const canReschedule = ["pending", "accepted"].includes(r.status);
+              const canCancel = !["completed", "cancelled"].includes(r.status);
+              const canChat = !!r.nurse;
+              return (
+                <li key={r.id} className="py-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-sm" style={{ color: COLORS.ink }}>{r.service}</p>
+                    <StatusPill status={r.status} />
+                  </div>
+                  <p className="text-xs mt-1" style={{ color: COLORS.muted, fontFamily: fontMono }}>{fmtLabel(new Date(r.date))} · {r.time}</p>
+
+                  {r.nurse && (
+                    <div className="mt-2 rounded-xl p-3 flex items-center gap-3" style={{ background: "#F6F4EA" }}>
+                      <div className="w-9 h-9 rounded-full flex items-center justify-center text-xs font-semibold shrink-0" style={{ background: COLORS.green, color: "#fff" }}>{initials(r.nurse.name)}</div>
+                      <div>
+                        <p className="text-sm" style={{ color: COLORS.ink }}>{r.nurse.name}</p>
+                        <p className="text-xs" style={{ color: COLORS.muted, fontFamily: fontMono }}>{r.nurse.phone} · {r.nurse.experience} yrs</p>
+                        {stats && <p className="text-xs mt-0.5" style={{ color: "#C9A227" }}>★ {stats.avg.toFixed(1)} ({stats.count})</p>}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex gap-2 mt-2">
+                    {canReschedule && <button onClick={() => setReschedulingId(reschedulingId === r.id ? null : r.id)} className="text-xs px-3 py-1.5 rounded-lg" style={{ background: COLORS.chip, color: COLORS.ink }}>Reschedule</button>}
+                    {canCancel && <button onClick={() => cancel(r.id)} className="text-xs px-3 py-1.5 rounded-lg" style={{ background: "#F6DCDC", color: COLORS.err }}>Cancel</button>}
+                  </div>
+
+                  {reschedulingId === r.id && <RescheduleBox onCancel={() => setReschedulingId(null)} onSave={(d, t) => saveReschedule(r.id, d, t)} />}
+
+                  {r.status === "completed" && (
+                    <div className="mt-2 rounded-xl p-3" style={{ background: "#F6F4EA" }}>
+                      <p className="text-[11px] uppercase tracking-wide mb-1" style={{ color: COLORS.gold, fontFamily: fontMono }}>Rate this visit</p>
+                      <Stars value={r.rating} onRate={r.rating ? undefined : (n) => rate(r.id, n)} readOnly={!!r.rating} />
+                    </div>
+                  )}
+
+                  {canChat && <ChatThread request={r} role="client" onSend={(text) => sendMsg(r.id, text)} />}
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
+      <section className="rounded-2xl p-5" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Service history</h2>
+        {history.length === 0 ? (
+          <p className="text-sm" style={{ color: COLORS.muted }}>Completed and cancelled visits will show up here.</p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: COLORS.line }}>
+            {history.map((r) => (
+              <li key={r.id} className="py-2.5 flex items-center justify-between text-sm">
+                <div>
+                  <p style={{ color: COLORS.ink }}>{r.service}</p>
+                  <p style={{ color: COLORS.muted }} className="text-xs">{fmtLabel(new Date(r.date))} · {r.time} {r.nurse ? `· ${r.nurse.name}` : ""}</p>
+                </div>
+                <div className="text-right">
+                  <StatusPill status={r.status} />
+                  {r.rating && <div className="mt-1"><Stars value={r.rating} readOnly /></div>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function NurseView({ requests, updateRequest, save }) {
+  const [session, setSession] = useState(null); // { phone, profile }
+
+  const pending = requests.filter((r) => r.status === "pending").sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+  const myAll = session ? requests.filter((r) => r.nurse?.phone === session.phone) : [];
+  const myActive = myAll.filter((r) => !["completed", "cancelled"].includes(r.status)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const myHistory = myAll.filter((r) => ["completed", "cancelled"].includes(r.status)).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  const stats = session ? nurseStats(requests, session.phone) : null;
+
+  if (!session) {
+    return <NurseAuth onVerified={(phone, profile) => setSession({ phone, profile })} />;
+  }
+
+  async function accept(reqId) {
+    await updateRequest(reqId, (r) => ({ ...r, status: "accepted", nurse: { name: session.profile.fullName, phone: session.phone, experience: session.profile.experience || "—" } }));
+  }
+  function advance(id, nextStatus) { updateRequest(id, (r) => ({ ...r, status: nextStatus })); }
+  function withdraw(id) { updateRequest(id, (r) => ({ ...r, status: "pending", nurse: null })); }
+  function sendMsg(id, text) { updateRequest(id, (r) => ({ ...r, messages: [...(r.messages || []), { from: "nurse", text, ts: Date.now() }] })); }
+
+  return (
+    <div>
+      <LoggedInBar name={session.profile.fullName} phone={session.phone} onLogout={() => setSession(null)} />
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Your profile</h2>
+        <p className="text-sm" style={{ color: COLORS.ink }}>{session.profile.qualification} · {session.profile.experience} yrs experience</p>
+        <p className="text-xs mt-1" style={{ color: COLORS.muted }}>License: {session.profile.license}</p>
+        <p className="text-xs mt-1" style={{ color: COLORS.muted }}>Services: {(session.profile.services || []).join(", ")}</p>
+        {stats && <p className="text-sm mt-2" style={{ color: "#C9A227" }}>★ {stats.avg.toFixed(1)} average ({stats.count} ratings)</p>}
+      </section>
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Open requests</h2>
+        {pending.length === 0 ? (
+          <p className="text-sm" style={{ color: COLORS.muted }}>No open requests right now.</p>
+        ) : (
+          <ul className="space-y-3">
+            {pending.map((r) => (
+              <li key={r.id} className="rounded-xl p-3" style={{ background: "#F6F4EA" }}>
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium" style={{ color: COLORS.ink }}>{r.service}</p>
+                  <span className="text-xs" style={{ color: COLORS.muted, fontFamily: fontMono }}>{fmtLabel(new Date(r.date))} · {r.time}</span>
+                </div>
+                <p className="text-xs mt-1" style={{ color: COLORS.muted }}>{r.address || "No address notes"}</p>
+                <button onClick={() => accept(r.id)} className="mt-2 w-full py-2 rounded-lg text-sm font-medium" style={{ background: COLORS.green, color: "#fff" }}>Accept request</button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Your active visits</h2>
+        {myActive.length === 0 ? (
+          <p className="text-sm" style={{ color: COLORS.muted }}>None yet.</p>
+        ) : (
+          <ul className="space-y-3">
+            {myActive.map((r) => (
+              <li key={r.id} className="rounded-xl p-3" style={{ background: "#F6F4EA" }}>
+                <div className="flex items-center justify-between">
+                  <p className="text-sm" style={{ color: COLORS.ink }}>{r.service} — {r.clientName}</p>
+                  <StatusPill status={r.status} />
+                </div>
+                <p className="text-xs mt-1" style={{ color: COLORS.muted, fontFamily: fontMono }}>{fmtLabel(new Date(r.date))} · {r.time} · {r.phone}</p>
+                <p className="text-xs mt-1" style={{ color: COLORS.muted }}>{r.address}</p>
+                <div className="flex gap-2 mt-2 flex-wrap">
+                  {r.status === "accepted" && <button onClick={() => advance(r.id, "on_the_way")} className="text-xs px-3 py-1.5 rounded-lg font-medium" style={{ background: COLORS.green, color: "#fff" }}>Start visit (on the way)</button>}
+                  {r.status === "on_the_way" && <button onClick={() => advance(r.id, "arrived")} className="text-xs px-3 py-1.5 rounded-lg font-medium" style={{ background: COLORS.green, color: "#fff" }}>Mark arrived</button>}
+                  {r.status === "arrived" && <button onClick={() => advance(r.id, "completed")} className="text-xs px-3 py-1.5 rounded-lg font-medium" style={{ background: COLORS.green, color: "#fff" }}>Mark completed</button>}
+                  {["accepted", "on_the_way"].includes(r.status) && <button onClick={() => withdraw(r.id)} className="text-xs px-3 py-1.5 rounded-lg" style={{ background: "#F6DCDC", color: COLORS.err }}>Withdraw</button>}
+                </div>
+                <ChatThread request={r} role="nurse" onSend={(text) => sendMsg(r.id, text)} />
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="rounded-2xl p-5" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>History</h2>
+        {myHistory.length === 0 ? (
+          <p className="text-sm" style={{ color: COLORS.muted }}>Completed and cancelled visits will show up here.</p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: COLORS.line }}>
+            {myHistory.map((r) => (
+              <li key={r.id} className="py-2.5 flex items-center justify-between text-sm">
+                <div>
+                  <p style={{ color: COLORS.ink }}>{r.service} — {r.clientName}</p>
+                  <p style={{ color: COLORS.muted }} className="text-xs">{fmtLabel(new Date(r.date))} · {r.time}</p>
+                </div>
+                <div className="text-right">
+                  <StatusPill status={r.status} />
+                  {r.rating && <div className="mt-1"><Stars value={r.rating} readOnly /></div>}
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function AdminView({ requests }) {
+  const [authed, setAuthed] = useState(false);
+  const [code, setCode] = useState("");
+  const [error, setError] = useState("");
+
+  if (!authed) {
+    return (
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Admin access</h2>
+        <Field value={code} onChange={(e) => setCode(e.target.value)} placeholder="Passcode" type="password" />
+        {error && <p className="text-xs mb-2" style={{ color: COLORS.err }}>{error}</p>}
+        <button onClick={() => code === ADMIN_PASSCODE ? setAuthed(true) : setError("Incorrect passcode.")} className="w-full py-3 rounded-xl font-medium" style={{ background: COLORS.ink, color: COLORS.bg }}>
+          Enter dashboard
+        </button>
+      </section>
+    );
+  }
+
+  const counts = requests.reduce((acc, r) => { acc[r.status] = (acc[r.status] || 0) + 1; return acc; }, {});
+  const nurseMap = {};
+  requests.forEach((r) => {
+    if (!r.nurse) return;
+    const key = r.nurse.phone;
+    if (!nurseMap[key]) nurseMap[key] = { name: r.nurse.name, phone: r.nurse.phone, experience: r.nurse.experience, completed: 0, ratings: [] };
+    if (r.status === "completed") nurseMap[key].completed += 1;
+    if (typeof r.rating === "number") nurseMap[key].ratings.push(r.rating);
+  });
+  const nurses = Object.values(nurseMap);
+  const recent = [...requests].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 25);
+
+  const stat = (label, val, color) => (
+    <div className="rounded-xl p-3 text-center" style={{ background: "#F6F4EA" }}>
+      <p className="text-2xl" style={{ fontFamily: fontMono, color: color || COLORS.ink }}>{val}</p>
+      <p className="text-[10px] uppercase tracking-wide mt-1" style={{ color: COLORS.muted }}>{label}</p>
+    </div>
+  );
+
+  return (
+    <div>
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Overview</h2>
+        <div className="grid grid-cols-3 gap-2">
+          {stat("Total", requests.length)}
+          {stat("Pending", counts.pending || 0, "#8A6D2A")}
+          {stat("Active", (counts.accepted || 0) + (counts.on_the_way || 0) + (counts.arrived || 0), "#3E5A8A")}
+          {stat("Completed", counts.completed || 0, COLORS.green)}
+          {stat("Cancelled", counts.cancelled || 0, COLORS.err)}
+          {stat("Nurses", nurses.length)}
+        </div>
+      </section>
+
+      <section className="rounded-2xl p-5 mb-4" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Nurses</h2>
+        {nurses.length === 0 ? (
+          <p className="text-sm" style={{ color: COLORS.muted }}>No nurse activity yet.</p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: COLORS.line }}>
+            {nurses.map((n) => {
+              const avg = n.ratings.length ? (n.ratings.reduce((a, b) => a + b, 0) / n.ratings.length).toFixed(1) : "—";
+              return (
+                <li key={n.phone} className="py-2.5 flex items-center justify-between text-sm">
+                  <div>
+                    <p style={{ color: COLORS.ink }}>{n.name}</p>
+                    <p className="text-xs" style={{ color: COLORS.muted, fontFamily: fontMono }}>{n.phone} · {n.experience} yrs</p>
+                  </div>
+                  <div className="text-right text-xs" style={{ color: COLORS.muted }}>
+                    <p>{n.completed} completed</p>
+                    <p style={{ color: "#C9A227" }}>★ {avg}</p>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
+      <section className="rounded-2xl p-5" style={{ background: COLORS.card }}>
+        <h2 className="text-xs uppercase tracking-wide mb-3" style={{ color: COLORS.gold, fontFamily: fontMono }}>Recent requests</h2>
+        {recent.length === 0 ? (
+          <p className="text-sm" style={{ color: COLORS.muted }}>No requests yet.</p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: COLORS.line }}>
+            {recent.map((r) => (
+              <li key={r.id} className="py-2.5 text-sm">
+                <div className="flex items-center justify-between">
+                  <p style={{ color: COLORS.ink }}>{r.service}</p>
+                  <StatusPill status={r.status} />
+                </div>
+                <p className="text-xs mt-0.5" style={{ color: COLORS.muted }}>
+                  {r.clientName} ({r.phone}) → {r.nurse ? r.nurse.name : "unassigned"} · {fmtLabel(new Date(r.date))} · {r.time}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function App() {
+  const [role, setRole] = useState("client");
+  const { requests, loading, save, updateRequest } = useRequests();
+
+  return (
+    <div className="min-h-screen pb-16" style={{ background: COLORS.bg, fontFamily: "'Inter', sans-serif" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+      `}</style>
+
+      <header className="px-6 pt-10 pb-8" style={{ background: COLORS.ink }}>
+        <div className="flex items-center gap-3 mb-5">
+          <div className="w-11 h-14 rounded-lg flex items-center justify-center shrink-0" style={{ background: "#FFFFFF" }}>
+            <FlameMark size={26} />
+          </div>
+          <div>
+            <p className="text-[10px] tracking-[0.2em] uppercase" style={{ color: "#9FB39C", fontFamily: fontMono }}>Home Care Requests</p>
+            <h1 className="text-2xl leading-tight" style={{ color: "#F6F4EA", fontFamily: fontDisplay }}>Felvic Medialliance</h1>
+          </div>
+        </div>
+
+        {role === "admin" ? (
+          <button onClick={() => setRole("client")} className="text-xs" style={{ color: "#9FB39C" }}>← Back to app</button>
+        ) : (
+          <Segmented value={role} onChange={setRole} />
+        )}
+      </header>
+
+      <main className="px-5 -mt-4">
+        {loading ? (
+          <p className="text-sm mt-6" style={{ color: COLORS.muted }}>Loading…</p>
+        ) : role === "client" ? (
+          <ClientView requests={requests} updateRequest={updateRequest} save={save} />
+        ) : role === "nurse" ? (
+          <NurseView requests={requests} updateRequest={updateRequest} save={save} />
+        ) : (
+          <AdminView requests={requests} />
+        )}
+
+        {role !== "admin" && (
+          <button onClick={() => setRole("admin")} className="w-full text-center text-xs underline mt-6 py-2" style={{ color: COLORS.muted }}>
+            Admin login
+          </button>
+        )}
+      </main>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+
+</script>
+
+<script>
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("service-worker.js").catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
